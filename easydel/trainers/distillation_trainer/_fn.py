@@ -117,33 +117,63 @@ def _per_token_xent(
         dtype: Output dtype for the per-token tensors.
 
     Returns:
-        ``(per_token_distill_xent, per_token_teacher_entropy)``: two
-        tensors of shape ``[...]`` (i.e. without the vocab axis).
+        ``(per_token_distill_xent, per_token_teacher_entropy, per_token_kl)``:
+        three tensors of shape ``[...]`` (i.e. without the vocab axis).
+        ``per_token_kl`` is the cancellation-free fp32 per-token KL.
     """
     compute_dtype = jnp.dtype(dtype)
     temp = jnp.asarray(temperature, dtype=compute_dtype)
 
+    # All vocab-wide reductions below run in fp32 (`.astype(float32)` fused INTO the reduction
+    # loop by XLA -- no fp32 [..., V] buffer is materialised). Rationale: under jit, the teacher
+    # and student logsumexp compile into two differently-fused bf16 reduction loops over the
+    # 248K vocab (stop_gradient blocks sharing them); each carries ~+-2.5e-2 of data-dependent
+    # rounding that does NOT cancel in (t_lse - s_lse), so the logged KL jittered +-0.03 and went
+    # spuriously negative near KL=0. fp32 reductions drop that floor to ~1e-6.
     teacher_scaled = jax.lax.stop_gradient(teacher_logits.astype(compute_dtype) / temp)
-    teacher_logsumexp = jax.nn.logsumexp(teacher_scaled, axis=-1, keepdims=True).astype(compute_dtype)
+    teacher_lse32 = jax.nn.logsumexp(teacher_scaled.astype(jnp.float32), axis=-1, keepdims=True)
+    teacher_logsumexp = teacher_lse32.astype(compute_dtype)
     teacher_log_probs = teacher_scaled - teacher_logsumexp
     teacher_probs = jnp.exp(teacher_log_probs).astype(compute_dtype)
-    per_token_teacher_entropy = -jnp.sum(
-        teacher_probs * teacher_log_probs,
-        axis=-1,
-        dtype=compute_dtype,
+    # Metric-only fp32 teacher probs: ``teacher_probs`` above is normalised with the bf16-rounded
+    # lse, so it sums to ``exp(delta) ~ 1 +- 0.03`` instead of 1. That mis-normalisation multiplies
+    # the O(|logits|) xent dot by ``1 + delta`` -> errors of O(delta * |logits|) ~ 2 nats (a true
+    # 0.97 xent can read as -1.35). The fp32-normalised probs below are used ONLY for the xent
+    # and entropy *metrics*; the bf16 ``teacher_probs`` stays in the per-token-KL term so the
+    # training gradient is unchanged. XLA fuses these into the reductions (no fp32 [..., V] buffer).
+    teacher_log_probs32 = teacher_scaled.astype(jnp.float32) - teacher_lse32
+    teacher_probs32 = jnp.exp(teacher_log_probs32)
+    per_token_teacher_entropy = (
+        -jnp.sum(
+            teacher_probs32 * teacher_log_probs32,
+            axis=-1,
+            dtype=jnp.float32,
+        )
     ).astype(dtype)
 
     student_scaled = student_logits.astype(compute_dtype) / temp
-    student_logsumexp = jax.nn.logsumexp(student_scaled, axis=-1).astype(compute_dtype)
+    student_lse32 = jax.nn.logsumexp(student_scaled.astype(jnp.float32), axis=-1)
+    student_logsumexp = student_lse32.astype(compute_dtype)
+    # fp32 subtraction with fp32-normalised probs: lse and the dot are both O(|logits|) ~ 50-70
+    # while their difference is O(0.6) (bf16 granularity at that magnitude is ~0.25).
     per_token_distill_xent = (
-        student_logsumexp
+        student_lse32
         - jnp.sum(
-            teacher_probs * student_scaled,
+            teacher_probs32 * student_scaled.astype(jnp.float32),
             axis=-1,
-            dtype=compute_dtype,
+            dtype=jnp.float32,
         )
     ).astype(dtype)
-    return per_token_distill_xent, per_token_teacher_entropy
+
+    # Well-conditioned per-token KL = sum_v p_t (log p_t - log p_s), rewritten as
+    #   sum_v p_t (t_scaled - s_scaled) - (t_lse - s_lse)
+    # with every reduction and the final subtraction in fp32 (see note above).
+    per_token_kl = jnp.sum(
+        teacher_probs * (teacher_scaled - student_scaled),
+        axis=-1,
+        dtype=jnp.float32,
+    ) - (teacher_lse32[..., 0] - student_lse32)
+    return per_token_distill_xent, per_token_teacher_entropy, per_token_kl
 
 
 def _kl_div_from_log_probs(log_target: Array, log_input: Array) -> Array:
@@ -242,7 +272,7 @@ def _compute_kl_and_ce(
     use_hard_labels: bool,
     temperature: float,
     dtype: jnp.dtype,
-) -> tuple[Array, Array, Array, Array]:
+) -> tuple[Array, Array, Array, Array, Array]:
     """Reduce per-token KL/CE contributions over one chunk of logits.
 
     Wraps :func:`_per_token_xent` with mask-weighted summation and the
@@ -266,19 +296,28 @@ def _compute_kl_and_ce(
         dtype: Output dtype.
 
     Returns:
-        ``(distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum)``;
+        ``(distill_xent_sum, teacher_entropy_sum, kl_sum, ce_sum, mask_sum)``.
+        ``kl_sum`` is the fp32 masked sum of per-token KL (the cancellation-free loss term);
+        ``mask_sum`` is accumulated in fp32 so bf16 scan carries cannot jitter the normalizer;
         ``ce_sum`` is zero when ``use_hard_labels`` is ``False``.
     """
-    per_token_distill_xent, per_token_teacher_entropy = _per_token_xent(
+    per_token_distill_xent, per_token_teacher_entropy, per_token_kl = _per_token_xent(
         teacher_logits,
         student_logits,
         temperature,
         dtype,
     )
 
+    # Loss/metric KL: sum the cancellation-free fp32 per-token KL from _per_token_xent (computed as
+    # sum_v p_t (t_scaled - s_scaled) - (t_lse - s_lse), not the distill_xent - teacher_entropy
+    # difference of two ~equal ~0.6 sums, which catastrophically cancels in bf16 and goes spuriously
+    # negative). Training gradient is unchanged: teacher terms are teacher-only (stop_gradient), so
+    # d(kl)/d(student) == d(distill_xent)/d(student).
+    mask_f32 = mask.astype(jnp.float32)
     distill_xent_sum = jnp.sum(per_token_distill_xent * mask)
     teacher_entropy_sum = jnp.sum(per_token_teacher_entropy * mask)
-    mask_sum = jnp.sum(mask)
+    mask_sum = jnp.sum(mask_f32)
+    kl_sum = jnp.sum(per_token_kl * mask_f32)
 
     ce_sum = jnp.zeros((), dtype=dtype)
     if use_hard_labels:
@@ -288,12 +327,13 @@ def _compute_kl_and_ce(
         ).astype(dtype)
         ce_sum = jnp.sum(per_token_ce * mask)
 
-    return distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum
+    return distill_xent_sum, teacher_entropy_sum, kl_sum, ce_sum, mask_sum
 
 
 def _finalize_distillation_metrics(
     distill_xent_sum: Array,
     teacher_entropy_sum: Array,
+    kl_sum: Array,
     ce_sum: Array,
     mask_sum: Array,
     temperature: float,
@@ -325,16 +365,25 @@ def _finalize_distillation_metrics(
 
     Returns:
         ``(total_loss, metrics)`` where ``metrics`` is a dict carrying
-        ``kl_loss``, ``distill_xent_loss``, ``teacher_entropy_loss``,
-        and ``ce_loss`` as scalar arrays.
+        ``kl_loss`` (from the cancellation-free ``kl_sum``),
+        ``distill_xent_loss``, ``teacher_entropy_loss``, and ``ce_loss``
+        as scalar arrays.
     """
     alpha_s = jnp.array(alpha, dtype=dtype)
     temp_sq = jnp.array(temperature * temperature, dtype=dtype)
     normalizer = jnp.maximum(mask_sum, jnp.ones((), dtype=dtype))
 
+    # Diagnostic split, kept only for monitoring. Do NOT subtract these to form the loss:
+    # both are ~equal large means, so the difference catastrophically cancels (the old bug that
+    # made kl_loss go negative). The loss/metric KL below uses the directly-summed per-token KL.
     distill_xent_loss = (distill_xent_sum / normalizer) * temp_sq
     teacher_entropy_loss = (teacher_entropy_sum / normalizer) * temp_sq
-    kl_loss = distill_xent_loss - teacher_entropy_loss
+
+    # KL = mean of per-token KL, accumulated cancellation-free in fp32 (see _compute_kl_and_ce).
+    # Always >= 0 up to per-token rounding; gradient is identical to the old distill_xent path.
+    norm32 = jnp.maximum(mask_sum.astype(jnp.float32), jnp.ones((), dtype=jnp.float32))
+    temp_sq32 = jnp.asarray(temperature * temperature, dtype=jnp.float32)
+    kl_loss = ((kl_sum / norm32) * temp_sq32).astype(dtype)
     total_loss = alpha_s * kl_loss
 
     ce_loss = jnp.zeros((), dtype=dtype)
@@ -517,6 +566,7 @@ def distillation_loss(
     if labels is not None:
         valid_label_mask = (labels != -100).astype(dtype)
         mask = valid_label_mask if mask is None else mask * valid_label_mask
+    mask_f32 = mask.astype(jnp.float32) if mask is not None else None
 
     # Vocab-parallel reduction. When a ``PartitionManager`` is supplied (and the in-context mesh has a
     # real >1 ``tp`` axis), resolve the semantic ``[BATCH, LENGTH, VOCAB]`` / ``[BATCH, LENGTH]`` specs
@@ -542,10 +592,10 @@ def distillation_loss(
         )
         per_token_divergence = per_token_distill_xent - per_token_teacher_entropy
         if mask is not None:
-            normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
-            distill_xent_loss = jnp.sum(per_token_distill_xent * mask) / normalizer
-            teacher_entropy_loss = jnp.sum(per_token_teacher_entropy * mask) / normalizer
-            divergence_loss = jnp.sum(per_token_divergence * mask) / normalizer
+            normalizer = jnp.maximum(jnp.sum(mask_f32), jnp.array(1.0, dtype=jnp.float32))
+            distill_xent_loss = jnp.sum(per_token_distill_xent * mask_f32) / normalizer
+            teacher_entropy_loss = jnp.sum(per_token_teacher_entropy * mask_f32) / normalizer
+            divergence_loss = jnp.sum(per_token_divergence * mask_f32) / normalizer
         else:
             distill_xent_loss = jnp.mean(per_token_distill_xent)
             teacher_entropy_loss = jnp.mean(per_token_teacher_entropy)
@@ -588,7 +638,7 @@ def distillation_loss(
             # non-divisible micro-batch / sp-indivisible sequence; padded rows carry zero weight so they
             # drop out of the masked mean (and the teacher-entropy reduction).
             _kl_pads = _vp_leading_pads(student_logits.shape[:-1], _vp_token_spec, _vp_mesh)
-            _kl_s, _kl_t, _kl_w = student_logits, teacher_logits, mask
+            _kl_s, _kl_t, _kl_w = student_logits, teacher_logits, mask_f32
             if any(_kl_pads):
                 if _kl_w is None:
                     _kl_w = jnp.ones(student_logits.shape[:-1], dtype=jnp.float32)
@@ -619,7 +669,7 @@ def distillation_loss(
             out = _fused_kl(
                 student_logits,
                 teacher_logits,
-                mask,
+                mask_f32,
                 reduction="mean",
                 direction=direction,
                 temperature=temperature,
@@ -654,11 +704,11 @@ def distillation_loss(
             _ce_pads = _vp_leading_pads(student_logits.shape[:-1], _vp_token_spec, _vp_mesh)
             _ce_s = student_logits
             _ce_l = safe_labels.astype(jnp.int32)
-            _ce_w = mask
+            _ce_w = mask_f32
             if any(_ce_pads):
                 _ce_s = _pad_leading(student_logits, _ce_pads)
                 _ce_l = _pad_leading(safe_labels.astype(jnp.int32), _ce_pads, fill=-100)
-                _ce_w = _pad_leading(mask, _ce_pads, fill=0.0) if mask is not None else None
+                _ce_w = _pad_leading(mask_f32, _ce_pads, fill=0.0) if mask_f32 is not None else None
             ce_out = _fused_ce(
                 _ce_s,
                 _ce_l,
@@ -679,7 +729,7 @@ def distillation_loss(
             ce_out = _fused_ce(
                 student_logits,
                 safe_labels.astype(jnp.int32),
-                mask,
+                mask_f32,
                 reduction="none",
                 ignore_index=-100,
                 platform="xla",
@@ -687,8 +737,8 @@ def distillation_loss(
             per_token_ce = ce_out.loss.astype(dtype)
 
         if mask is not None:
-            ce_loss = per_token_ce * mask
-            normalizer = jnp.maximum(jnp.sum(mask), jnp.array(1.0, dtype=dtype))
+            ce_loss = per_token_ce * mask_f32
+            normalizer = jnp.maximum(jnp.sum(mask_f32), jnp.array(1.0, dtype=jnp.float32))
             ce_loss = jnp.sum(ce_loss) / normalizer
         else:
             ce_loss = jnp.mean(per_token_ce)
@@ -1019,19 +1069,27 @@ def chunked_distillation_loss(
 
     def _scan_body(carry, xs):
         s_h, t_h, m, sl = xs
-        distill_xent, teacher_entropy, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
-        return (carry[0] + distill_xent, carry[1] + teacher_entropy, carry[2] + ce, carry[3] + ms), None
+        distill_xent, teacher_entropy, kl, ce, ms = _chunk_kl_ce(s_h, t_h, m, sl)
+        return (
+            carry[0] + distill_xent,
+            carry[1] + teacher_entropy,
+            carry[2] + kl,
+            carry[3] + ce,
+            carry[4] + ms,
+        ), None
 
     _zero = jnp.zeros((), dtype=dtype)
-    (distill_xent_sum, teacher_entropy_sum, ce_sum, mask_sum), _ = jax.lax.scan(
+    _zero32 = jnp.zeros((), dtype=jnp.float32)  # kl_sum and mask_sum accumulate in fp32
+    (distill_xent_sum, teacher_entropy_sum, kl_sum, ce_sum, mask_sum), _ = jax.lax.scan(
         _scan_body,
-        (_zero, _zero, _zero, _zero),
+        (_zero, _zero, _zero32, _zero, _zero32),
         (s_chunks, t_chunks, m_chunks, l_chunks),
     )
 
     return _finalize_distillation_metrics(
         distill_xent_sum=distill_xent_sum,
         teacher_entropy_sum=teacher_entropy_sum,
+        kl_sum=kl_sum,
         ce_sum=ce_sum,
         mask_sum=mask_sum,
         temperature=temperature,
